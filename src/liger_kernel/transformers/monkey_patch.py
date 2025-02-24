@@ -32,6 +32,7 @@ from liger_kernel.transformers.rope import liger_rotary_pos_emb
 from liger_kernel.transformers.swiglu import LigerBlockSparseTop2MLP
 from liger_kernel.transformers.swiglu import LigerPhi3SwiGLUMLP
 from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+from liger_kernel.transformers.swiglu import LigerGraniteMoeSharedMLP, LigerGraniteMoeSharedMoESwiGLUMLP
 
 transformer_version = version.parse(transformers.__version__)
 
@@ -59,6 +60,76 @@ def _patch_layer_norm_module(module, eps=1e-6):
     module.hidden_size = module.normalized_shape
     _bind_method_to_module(module, "forward", LigerLayerNorm.forward)
     _bind_method_to_module(module, "extra_repr", LigerLayerNorm.extra_repr)
+
+
+def apply_liger_kernel_to_granitemoe_shared(
+    rope: bool = True,
+    cross_entropy: bool = True,
+    fused_linear_cross_entropy: bool = False,
+    rms_norm: bool = True,
+    swiglu: bool = True,
+    model: PreTrainedModel = None,
+) -> None:
+    """
+    Apply Liger kernels to replace original implementation in HuggingFace Mixtral models
+
+    Args:
+        rope (bool): Whether to apply Liger's rotary position embedding. Default is True.
+        cross_entropy (bool): Whether to apply Liger's cross entropy loss. Default is False.
+        fused_linear_cross_entropy (bool):
+            Whether to apply Liger's fused linear cross entropy loss. Default is True.
+            `cross_entropy` and `fused_linear_cross_entropy` cannot both be True.
+            If `fused_linear_cross_entropy` is True, the logits will not be materialized but more memory efficient.
+        rms_norm (bool): Whether to apply Liger's RMSNorm. Default is True.
+        swiglu (bool): Whether to apply Liger's SwiGLU MLP. Default is True.
+        model (PreTrainedModel): The model instance to apply Liger kernels to, if the model has already been
+        loaded. Default is None.
+    """
+
+    assert not (cross_entropy and fused_linear_cross_entropy), (
+        "cross_entropy and fused_linear_cross_entropy cannot both be True."
+    )
+
+    from transformers.models.granitemoeshared import modeling_granitemoeshared
+    from transformers.models.granitemoeshared.modeling_granitemoeshared import GraniteMoeSharedModel
+
+    if rope:
+        GraniteMoeSharedModel.apply_rotary_pos_emb = liger_rotary_pos_emb
+    if rms_norm:
+        modeling_granitemoeshared.GraniteMoeSharedRMSNorm = LigerRMSNorm
+    if cross_entropy:
+        if transformer_version >= version.parse(SUPPORTED_TRANSFORMER_VERSION):
+            from transformers.loss.loss_utils import nn
+
+            nn.functional.cross_entropy = liger_cross_entropy
+        else:
+            logger.warning(TRANSFORMER_DEPRECATION_WARNING)
+            modeling_granitemoeshared.CrossEntropyLoss = LigerCrossEntropyLoss
+
+    if fused_linear_cross_entropy:
+        raise NotImplementedError("LigerFusedLinearCrossEntropy is not available for Granite models.")
+
+    if model is not None:
+        # The model instance already exists, so we need to additionally patch the
+        # instance variables that reference already-instantiated modules
+
+        # get the base model from the model instance
+        base_model: GraniteMoeSharedModel = getattr(model, model.base_model_prefix, model)
+
+        if rms_norm:
+            _patch_rms_norm_module(base_model.norm)
+
+        for decoder_layer in base_model.layers:
+            if swiglu:
+                _bind_method_to_module(decoder_layer.block_sparse_moe, "forward", LigerGraniteMoeSharedMoESwiGLUMLP.forward)
+                if base_model.config.shared_intermediate_size != 0:
+                    _bind_method_to_module(decoder_layer.shared_mlp, "forward", LigerGraniteMoeSharedMLP.forward)
+            if rms_norm:
+                _patch_rms_norm_module(decoder_layer.input_layernorm)
+                _patch_rms_norm_module(decoder_layer.post_attention_layernorm)
+
+
+
 
 
 def apply_liger_kernel_to_granite(
